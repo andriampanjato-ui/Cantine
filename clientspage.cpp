@@ -45,7 +45,7 @@ ClientsPage::ClientsPage(QWidget *parent)
     m_table = new QTableWidget(this);
     m_table->setColumnCount(3);
     m_table->setHorizontalHeaderLabels(
-        {QStringLiteral("ID"), QStringLiteral("Nom"), QStringLiteral("Téléphone")});
+        {QStringLiteral("N°"), QStringLiteral("Nom"), QStringLiteral("Téléphone")});
     m_table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
     m_table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
     m_table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
@@ -111,10 +111,10 @@ void ClientsPage::refresh()
     for (int row = 0; row < clients.size(); ++row) {
         const ClientData &client = clients.at(row);
 
-        auto *itemId = new QTableWidgetItem(QString::number(client.id));
-        itemId->setData(Qt::UserRole, client.id);
-        itemId->setTextAlignment(Qt::AlignCenter);
-        m_table->setItem(row, 0, itemId);
+        auto *itemNumero = new QTableWidgetItem(QString::number(row + 1));
+        itemNumero->setData(Qt::UserRole, client.id);
+        itemNumero->setTextAlignment(Qt::AlignCenter);
+        m_table->setItem(row, 0, itemNumero);
         m_table->setItem(row, 1, new QTableWidgetItem(client.nom));
         m_table->setItem(row, 2, new QTableWidgetItem(client.telephone));
     }
@@ -195,8 +195,9 @@ void ClientsPage::onSupprimer()
     const QString nom = m_table->item(row, 1) ? m_table->item(row, 1)->text() : QString();
 
     const QMessageBox::StandardButton reponse = QMessageBox::question(
-        this, QStringLiteral("Confirmer la suppression"),
-        QStringLiteral("Supprimer définitivement le client « %1 » ?").arg(nom),
+        this, QStringLiteral("Confirmer la suppression (Administrateur)"),
+        QStringLiteral("Supprimer définitivement le client « %1 » ?\n\n"
+                       "Les commandes et l'historique seront conservés avec un aperçu du client."),
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
 
     if (reponse != QMessageBox::Yes) {
@@ -209,7 +210,7 @@ void ClientsPage::onSupprimer()
         return;
     }
     QMessageBox::information(this, QStringLiteral("Succès"),
-                             QStringLiteral("Le client a été supprimé."));
+                             QStringLiteral("Le client a été supprimé. Les commandes historiques ont été conservées."));
     viderFormulaire();
     refresh();
 }

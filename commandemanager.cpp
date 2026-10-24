@@ -18,8 +18,6 @@ void setError(QString *error, const QString &message)
     }
 }
 
-// Neutralise les caractères spéciaux de LIKE pour qu'ils soient recherchés
-// littéralement (le caractère d'échappement explicite est « ! »).
 QString echapperLike(QString valeur)
 {
     valeur.replace(QLatin1Char('!'), QStringLiteral("!!"));
@@ -31,16 +29,14 @@ QString echapperLike(QString valeur)
 bool demarrerTransaction(QString *error)
 {
     QSqlQuery query(Database::instance()->getDatabase());
-    // Niveau READ COMMITTED : après l'obtention des verrous, les quantités
-    // déjà validées par une autre transaction sont visibles.
     if (!query.exec(QStringLiteral("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))) {
         setError(error, QStringLiteral("Impossible de configurer la transaction : %1")
                             .arg(query.lastError().text()));
         return false;
     }
-    if (!query.exec(QStringLiteral("START TRANSACTION"))) {
+    if (!Database::instance()->getDatabase().transaction()) {
         setError(error, QStringLiteral("Impossible de démarrer la transaction : %1")
-                            .arg(query.lastError().text()));
+                            .arg(Database::instance()->getDatabase().lastError().text()));
         return false;
     }
     return true;
@@ -48,12 +44,9 @@ bool demarrerTransaction(QString *error)
 
 bool validerTransaction(QString *error)
 {
-    QSqlQuery query(Database::instance()->getDatabase());
-    if (!query.exec(QStringLiteral("COMMIT"))) {
+    if (!Database::instance()->getDatabase().commit()) {
         setError(error, QStringLiteral("Impossible de valider la transaction : %1")
-                            .arg(query.lastError().text()));
-        QSqlQuery rollback(Database::instance()->getDatabase());
-        rollback.exec(QStringLiteral("ROLLBACK"));
+                            .arg(Database::instance()->getDatabase().lastError().text()));
         return false;
     }
     return true;
@@ -61,8 +54,92 @@ bool validerTransaction(QString *error)
 
 void annulerTransaction()
 {
+    Database::instance()->getDatabase().rollback();
+}
+
+bool verrouillerMenus(const QList<int> &idsMenu, QString *error)
+{
+    if (idsMenu.isEmpty()) {
+        return true;
+    }
     QSqlQuery query(Database::instance()->getDatabase());
-    query.exec(QStringLiteral("ROLLBACK"));
+    QString sql = QStringLiteral("SELECT id_menu, quantite_initiale FROM menu_jour WHERE id_menu IN (");
+    for (int i = 0; i < idsMenu.size(); ++i) {
+        sql += QStringLiteral("?");
+        if (i < idsMenu.size() - 1) {
+            sql += QStringLiteral(",");
+        }
+    }
+    sql += QStringLiteral(") FOR UPDATE");
+    query.prepare(sql);
+    for (int id : idsMenu) {
+        query.addBindValue(id);
+    }
+    if (!query.exec()) {
+        setError(error, QStringLiteral("Impossible de verrouiller les menus : %1")
+                            .arg(query.lastError().text()));
+        return false;
+    }
+    return true;
+}
+
+int quantiteCommandeeVerouillee(int idMenu, QString *error)
+{
+    QSqlQuery query(Database::instance()->getDatabase());
+    query.prepare(QStringLiteral(
+        "SELECT COALESCE(SUM(dc.quantite), 0) "
+        "FROM detail_commande dc "
+        "INNER JOIN commande c ON c.id_commande = dc.id_commande "
+        "WHERE dc.id_menu = ? AND c.statut = 'VALIDEE' "
+        "FOR UPDATE"));
+    query.addBindValue(idMenu);
+    if (!query.exec()) {
+        setError(error, QStringLiteral("Impossible de vérifier les quantités commandées : %1")
+                            .arg(query.lastError().text()));
+        return -1;
+    }
+    if (query.next()) {
+        return query.value(0).toInt();
+    }
+    return 0;
+}
+
+bool recupererMenu(int idMenu, int *quantiteInitiale, double *prixActuel, QString *error)
+{
+    if (!quantiteInitiale || !prixActuel) {
+        setError(error, QStringLiteral("Erreur interne : paramètres manquants."));
+        return false;
+    }
+    QSqlQuery query(Database::instance()->getDatabase());
+    query.prepare(QStringLiteral(
+        "SELECT m.quantite_initiale, p.prix "
+        "FROM menu_jour m "
+        "LEFT JOIN plat p ON p.id_plat = m.id_plat "
+        "WHERE m.id_menu = ?"));
+    query.addBindValue(idMenu);
+    if (!query.exec()) {
+        setError(error, QStringLiteral("Impossible de récupérer le menu : %1")
+                            .arg(query.lastError().text()));
+        return false;
+    }
+    if (!query.next()) {
+        setError(error, QStringLiteral("Menu introuvable."));
+        return false;
+    }
+    *quantiteInitiale = query.value(0).toInt();
+    *prixActuel = query.value(1).toDouble();
+    return true;
+}
+
+bool clientExiste(int idClient)
+{
+    if (idClient <= 0) {
+        return false;
+    }
+    QSqlQuery query(Database::instance()->getDatabase());
+    query.prepare(QStringLiteral("SELECT 1 FROM client WHERE id_client = ?"));
+    query.addBindValue(idClient);
+    return query.exec() && query.next();
 }
 
 } // namespace
@@ -73,67 +150,101 @@ CommandeManager::CommandeManager(QObject *parent)
 }
 
 int CommandeManager::enregistrerCommande(int idClient,
-                                         const QDateTime &dateCommande,
-                                         const QList<LigneCommande> &lignes,
-                                         bool valider,
-                                         QString *error)
+                                        const QDateTime &dateCommande,
+                                        const QList<LigneCommande> &lignes,
+                                        bool valider,
+                                        QString *error)
 {
-    if (!Database::instance()->isConnected()) {
-        setError(error, QStringLiteral("Aucune connexion active à la base de données."));
-        return -1;
-    }
     if (idClient <= 0) {
         setError(error, QStringLiteral("Sélectionnez un client."));
         return -1;
     }
+    if (!clientExiste(idClient)) {
+        setError(error, QStringLiteral("Client introuvable."));
+        return -1;
+    }
     if (!dateCommande.isValid()) {
-        setError(error, QStringLiteral("La date de la commande est invalide."));
+        setError(error, QStringLiteral("Date de commande invalide."));
         return -1;
     }
     if (lignes.isEmpty()) {
-        setError(error, QStringLiteral("Ajoutez au moins une ligne à la commande."));
+        setError(error, QStringLiteral("Ajoutez au moins un plat à la commande."));
         return -1;
     }
 
-    for (const LigneCommande &ligne : lignes) {
-        if (ligne.quantite <= 0) {
-            setError(error, QStringLiteral(
-                "La quantité doit être strictement positive pour chaque plat."));
-            return -1;
-        }
+    QSqlDatabase db = Database::instance()->getDatabase();
+    if (!db.isOpen()) {
+        setError(error, QStringLiteral("Aucune connexion active à la base de données."));
+        return -1;
     }
 
     if (!demarrerTransaction(error)) {
         return -1;
     }
 
-    QSqlDatabase db = Database::instance()->getDatabase();
-
-    // Vérifier que le client existe.
-    {
-        QSqlQuery query(db);
-        query.prepare(QStringLiteral("SELECT id_client FROM client WHERE id_client = ?"));
-        query.addBindValue(idClient);
-        if (!query.exec()) {
+    QList<int> idsMenu;
+    idsMenu.reserve(lignes.size());
+    for (const LigneCommande &ligne : lignes) {
+        if (ligne.idMenu <= 0 || ligne.quantite <= 0) {
             annulerTransaction();
-            setError(error, QStringLiteral("Erreur SQL : %1").arg(query.lastError().text()));
+            setError(error, QStringLiteral("Chaque ligne doit avoir un menu et une quantité valide."));
             return -1;
         }
-        if (!query.next()) {
+        idsMenu.append(ligne.idMenu);
+    }
+    std::sort(idsMenu.begin(), idsMenu.end());
+    idsMenu.erase(std::unique(idsMenu.begin(), idsMenu.end()), idsMenu.end());
+    if (!verrouillerMenus(idsMenu, error)) {
+        annulerTransaction();
+        return -1;
+    }
+
+    QMap<int, int> quantitesParMenu;
+    for (const LigneCommande &ligne : lignes) {
+        quantitesParMenu[ligne.idMenu] += ligne.quantite;
+    }
+
+    for (auto it = quantitesParMenu.constBegin(); it != quantitesParMenu.constEnd(); ++it) {
+        int quantiteInitiale = 0;
+        double prixActuel = 0.0;
+        if (!recupererMenu(it.key(), &quantiteInitiale, &prixActuel, error)) {
             annulerTransaction();
-            setError(error, QStringLiteral("Le client sélectionné n'existe plus."));
+            return -1;
+        }
+        const int dejaCommandee = quantiteCommandeeVerouillee(it.key(), error);
+        if (dejaCommandee < 0) {
+            annulerTransaction();
+            return -1;
+        }
+        const int restante = quantiteInitiale - dejaCommandee;
+        if (it.value() > restante) {
+            annulerTransaction();
+            setError(error, QStringLiteral("Quantité insuffisante pour le menu sélectionné."));
             return -1;
         }
     }
 
-    // Insérer la commande (toujours en attente au départ).
+    QString nomClient;
+    QString telephoneClient;
+    {
+        QSqlQuery info(db);
+        info.prepare(QStringLiteral("SELECT nom, telephone FROM client WHERE id_client = ?"));
+        info.addBindValue(idClient);
+        if (info.exec() && info.next()) {
+            nomClient = info.value(0).toString();
+            telephoneClient = info.value(1).toString();
+        }
+    }
+
     int idCommande = 0;
     {
         QSqlQuery query(db);
         query.prepare(QStringLiteral(
-            "INSERT INTO commande (id_client, date_commande, statut) "
-            "VALUES (?, ?, 'EN_ATTENTE')"));
+            "INSERT INTO commande (id_client, nom_client_snapshot, telephone_client_snapshot, date_commande, statut) "
+            "VALUES (?, ?, ?, ?, 'EN_ATTENTE')"));
         query.addBindValue(idClient);
+        query.addBindValue(nomClient);
+        query.addBindValue(telephoneClient);
         query.addBindValue(dateCommande.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")));
         if (!query.exec()) {
             annulerTransaction();
@@ -144,69 +255,42 @@ int CommandeManager::enregistrerCommande(int idClient,
         idCommande = query.lastInsertId().toInt();
     }
 
-    // Regrouper les lignes par menu (l'interface fusionne déjà les doublons,
-    // mais l'API doit rester fiable) puis verrouiller les menus dans l'ordre
-    // croissant de leur identifiant pour éviter les interblocages.
-    QMap<int, int> quantitesParMenu;
     for (const LigneCommande &ligne : lignes) {
-        if (ligne.idMenu <= 0) {
+        int quantiteInitiale = 0;
+        double prixActuel = 0.0;
+        if (!recupererMenu(ligne.idMenu, &quantiteInitiale, &prixActuel, error)) {
             annulerTransaction();
-            setError(error, QStringLiteral("Ligne de commande invalide (menu manquant)."));
             return -1;
         }
-        quantitesParMenu[ligne.idMenu] += ligne.quantite;
-    }
-
-    for (auto it = quantitesParMenu.cbegin(); it != quantitesParMenu.cend(); ++it) {
-        const int idMenu = it.key();
-        const int quantite = it.value();
-
-        QSqlQuery menuQuery(db);
-        menuQuery.prepare(QStringLiteral(
-            "SELECT m.date_menu, p.prix, p.nom_plat "
-            "FROM menu_jour m "
-            "INNER JOIN plat p ON p.id_plat = m.id_plat "
-            "WHERE m.id_menu = ? FOR UPDATE"));
-        menuQuery.addBindValue(idMenu);
-
-        if (!menuQuery.exec()) {
-            annulerTransaction();
-            setError(error, QStringLiteral("Erreur SQL lors du verrouillage du menu : %1")
-                                .arg(menuQuery.lastError().text()));
-            return -1;
+        if (prixActuel < 0.0) {
+            prixActuel = 0.0;
         }
-        if (!menuQuery.next()) {
-            annulerTransaction();
-            setError(error, QStringLiteral("Le menu sélectionné n'existe plus."));
-            return -1;
+        QString nomPlatSnapshot;
+        QString nomMenuSnapshot;
+        {
+            QSqlQuery infoMenu(db);
+            infoMenu.prepare(QStringLiteral(
+                "SELECT p.nom_plat FROM menu_jour m LEFT JOIN plat p ON p.id_plat = m.id_plat WHERE m.id_menu = ?"));
+            infoMenu.addBindValue(ligne.idMenu);
+            if (infoMenu.exec() && infoMenu.next()) {
+                nomPlatSnapshot = infoMenu.value(0).toString();
+                nomMenuSnapshot = nomPlatSnapshot;
+            }
         }
-
-        const QDate dateMenu = menuQuery.value(0).toDate();
-        const double prixActuel = menuQuery.value(1).toDouble();
-        const QString nomPlat = menuQuery.value(2).toString();
-
-        if (dateMenu != dateCommande.date()) {
+        QSqlQuery queryDetail(db);
+        queryDetail.prepare(QStringLiteral(
+            "INSERT INTO detail_commande (id_commande, id_menu, nom_plat_snapshot, nom_menu_snapshot, quantite, prix_unitaire) "
+            "VALUES (?, ?, ?, ?, ?, ?)"));
+        queryDetail.addBindValue(idCommande);
+        queryDetail.addBindValue(ligne.idMenu);
+        queryDetail.addBindValue(nomPlatSnapshot);
+        queryDetail.addBindValue(nomMenuSnapshot);
+        queryDetail.addBindValue(ligne.quantite);
+        queryDetail.addBindValue(prixActuel);
+        if (!queryDetail.exec()) {
             annulerTransaction();
-            setError(error, QStringLiteral(
-                "Commande refusée : le plat « %1 » n'appartient pas au menu du %2.")
-                .arg(nomPlat, dateCommande.date().toString(QStringLiteral("dd/MM/yyyy"))));
-            return -1;
-        }
-
-        QSqlQuery detailQuery(db);
-        detailQuery.prepare(QStringLiteral(
-            "INSERT INTO detail_commande (id_commande, id_menu, quantite, prix_unitaire) "
-            "VALUES (?, ?, ?, ?)"));
-        detailQuery.addBindValue(idCommande);
-        detailQuery.addBindValue(idMenu);
-        detailQuery.addBindValue(quantite);
-        // Le prix unitaire est enregistré dans le détail pour conserver l'historique.
-        detailQuery.addBindValue(prixActuel);
-
-        if (!detailQuery.exec()) {
-            annulerTransaction();
-            setError(error, QStringLiteral("Impossible d'ajouter une ligne de commande : %1")
-                                .arg(detailQuery.lastError().text()));
+            setError(error, QStringLiteral("Impossible d'ajouter le détail de commande : %1")
+                                .arg(queryDetail.lastError().text()));
             return -1;
         }
     }
@@ -219,333 +303,208 @@ int CommandeManager::enregistrerCommande(int idClient,
     }
 
     if (!validerTransaction(error)) {
+        annulerTransaction();
         return -1;
     }
     return idCommande;
 }
 
+bool CommandeManager::validerCommande(int idCommande, QString *error)
+{
+    if (idCommande <= 0) {
+        setError(error, QStringLiteral("Aucune commande sélectionnée."));
+        return false;
+    }
+    if (!demarrerTransaction(error)) {
+        return false;
+    }
+    if (!validerInterne(idCommande, error)) {
+        annulerTransaction();
+        return false;
+    }
+    if (!validerTransaction(error)) {
+        annulerTransaction();
+        return false;
+    }
+    return true;
+}
+
 bool CommandeManager::validerInterne(int idCommande, QString *error)
 {
-    QSqlDatabase db = Database::instance()->getDatabase();
-
-    QDate dateCommande;
-    {
-        QSqlQuery query(db);
-        query.prepare(QStringLiteral(
-            "SELECT DATE(date_commande), statut FROM commande WHERE id_commande = ? FOR UPDATE"));
-        query.addBindValue(idCommande);
-        if (!query.exec() || !query.next()) {
-            setError(error, QStringLiteral("Commande introuvable."));
-            return false;
-        }
-        dateCommande = query.value(0).toDate();
-        const QString statut = query.value(1).toString();
-        if (statut != QStringLiteral("EN_ATTENTE")) {
-            setError(error, QStringLiteral(
-                "Seules les commandes en attente peuvent être validées (statut actuel : %1).")
-                .arg(statut));
-            return false;
-        }
+    QSqlQuery statutQuery(Database::instance()->getDatabase());
+    statutQuery.prepare(QStringLiteral("SELECT statut FROM commande WHERE id_commande = ? FOR UPDATE"));
+    statutQuery.addBindValue(idCommande);
+    if (!statutQuery.exec()) {
+        setError(error, QStringLiteral("Impossible de vérifier la commande : %1")
+                            .arg(statutQuery.lastError().text()));
+        return false;
     }
-
-    QList<int> menus;
-    {
-        QSqlQuery query(db);
-        query.prepare(QStringLiteral(
-            "SELECT DISTINCT id_menu FROM detail_commande WHERE id_commande = ? ORDER BY id_menu"));
-        query.addBindValue(idCommande);
-        if (!query.exec()) {
-            setError(error, QStringLiteral("Erreur SQL : %1").arg(query.lastError().text()));
-            return false;
-        }
-        while (query.next()) {
-            menus.append(query.value(0).toInt());
-        }
+    if (!statutQuery.next()) {
+        setError(error, QStringLiteral("Commande introuvable."));
+        return false;
     }
-
-    if (menus.isEmpty()) {
-        setError(error, QStringLiteral("La commande ne contient aucune ligne."));
+    const QString statut = statutQuery.value(0).toString();
+    if (statut == QStringLiteral("VALIDEE")) {
+        return true;
+    }
+    if (statut == QStringLiteral("ANNULEE")) {
+        setError(error, QStringLiteral("Impossible de valider une commande annulée."));
         return false;
     }
 
-    for (int idMenu : menus) {
-        QSqlQuery menuQuery(db);
-        menuQuery.prepare(QStringLiteral(
-            "SELECT m.date_menu, m.quantite_initiale, p.nom_plat "
-            "FROM menu_jour m "
-            "INNER JOIN plat p ON p.id_plat = m.id_plat "
-            "WHERE m.id_menu = ? FOR UPDATE"));
-        menuQuery.addBindValue(idMenu);
-
-        if (!menuQuery.exec()) {
-            setError(error, QStringLiteral("Erreur SQL lors du verrouillage du menu : %1")
-                                .arg(menuQuery.lastError().text()));
+    QList<QPair<int, int> > lignes;
+    {
+        QSqlQuery lignesQuery(Database::instance()->getDatabase());
+        lignesQuery.prepare(QStringLiteral(
+            "SELECT id_menu, quantite FROM detail_commande WHERE id_commande = ?"));
+        lignesQuery.addBindValue(idCommande);
+        if (!lignesQuery.exec()) {
+            setError(error, QStringLiteral("Impossible de lire les détails de la commande : %1")
+                                .arg(lignesQuery.lastError().text()));
             return false;
         }
-        if (!menuQuery.next()) {
-            setError(error, QStringLiteral("Un plat de la commande n'existe plus dans les menus."));
-            return false;
-        }
-
-        const QDate dateMenu = menuQuery.value(0).toDate();
-        const int quantiteInitiale = menuQuery.value(1).toInt();
-        const QString nomPlat = menuQuery.value(2).toString();
-
-        if (dateMenu != dateCommande) {
-            setError(error, QStringLiteral(
-                "Commande refusée : le plat « %1 » n'appartient pas au menu du %2.")
-                .arg(nomPlat, dateCommande.toString(QStringLiteral("dd/MM/yyyy"))));
-            return false;
-        }
-
-        int quantiteDemandee = 0;
-        {
-            QSqlQuery query(db);
-            query.prepare(QStringLiteral(
-                "SELECT COALESCE(SUM(quantite), 0) FROM detail_commande "
-                "WHERE id_commande = ? AND id_menu = ?"));
-            query.addBindValue(idCommande);
-            query.addBindValue(idMenu);
-            if (!query.exec() || !query.next()) {
-                setError(error, QStringLiteral("Erreur SQL : %1").arg(query.lastError().text()));
-                return false;
+        QList<int> idsMenu;
+        while (lignesQuery.next()) {
+            const int idMenu = lignesQuery.value(0).toInt();
+            const int quantite = lignesQuery.value(1).toInt();
+            if (idMenu > 0) {
+                lignes.append(qMakePair(idMenu, quantite));
+                idsMenu.append(idMenu);
             }
-            quantiteDemandee = query.value(0).toInt();
         }
-
-        int quantiteDejaValidee = 0;
-        {
-            QSqlQuery query(db);
-            query.prepare(QStringLiteral(
-                "SELECT COALESCE(SUM(dc.quantite), 0) "
-                "FROM detail_commande dc "
-                "INNER JOIN commande c ON c.id_commande = dc.id_commande "
-                "WHERE dc.id_menu = ? AND c.statut = 'VALIDEE'"));
-            query.addBindValue(idMenu);
-            if (!query.exec() || !query.next()) {
-                setError(error, QStringLiteral("Erreur SQL : %1").arg(query.lastError().text()));
-                return false;
-            }
-            quantiteDejaValidee = query.value(0).toInt();
-        }
-
-        const int quantiteRestante = quantiteInitiale - quantiteDejaValidee;
-        if (quantiteDemandee > quantiteRestante) {
-            setError(error, QStringLiteral(
-                "Commande refusée : quantité insuffisante pour le plat « %1 ».\n"
-                "Quantité demandée : %2 — quantité restante : %3.")
-                .arg(nomPlat).arg(quantiteDemandee).arg(qMax(0, quantiteRestante)));
+        std::sort(idsMenu.begin(), idsMenu.end());
+        idsMenu.erase(std::unique(idsMenu.begin(), idsMenu.end()), idsMenu.end());
+        if (!verrouillerMenus(idsMenu, error)) {
             return false;
         }
     }
 
-    QSqlQuery updateQuery(db);
-    updateQuery.prepare(QStringLiteral(
-        "UPDATE commande SET statut = 'VALIDEE' WHERE id_commande = ?"));
+    QMap<int, int> totalParMenu;
+    for (const auto &ligne : lignes) {
+        if (ligne.first > 0) {
+            totalParMenu[ligne.first] += ligne.second;
+        }
+    }
+    for (auto it = totalParMenu.constBegin(); it != totalParMenu.constEnd(); ++it) {
+        int quantiteInitiale = 0;
+        double prixActuel = 0.0;
+        if (!recupererMenu(it.key(), &quantiteInitiale, &prixActuel, error)) {
+            return false;
+        }
+        const int dejaCommandee = quantiteCommandeeVerouillee(it.key(), error);
+        if (dejaCommandee < 0) {
+            return false;
+        }
+        const int restante = quantiteInitiale - dejaCommandee;
+        if (it.value() > restante) {
+            setError(error, QStringLiteral("Quantité insuffisante pour valider cette commande."));
+            return false;
+        }
+    }
+
+    QSqlQuery updateQuery(Database::instance()->getDatabase());
+    updateQuery.prepare(QStringLiteral("UPDATE commande SET statut = 'VALIDEE' WHERE id_commande = ? AND statut = 'EN_ATTENTE'"));
     updateQuery.addBindValue(idCommande);
     if (!updateQuery.exec()) {
         setError(error, QStringLiteral("Impossible de valider la commande : %1")
                             .arg(updateQuery.lastError().text()));
         return false;
     }
+    if (updateQuery.numRowsAffected() == 0) {
+        setError(error, QStringLiteral("La commande n'a pas pu être validée (statut modifié entre-temps)."));
+        return false;
+    }
     return true;
-}
-
-bool CommandeManager::validerCommande(int idCommande, QString *error)
-{
-    if (!Database::instance()->isConnected()) {
-        setError(error, QStringLiteral("Aucune connexion active à la base de données."));
-        return false;
-    }
-    if (idCommande <= 0) {
-        setError(error, QStringLiteral("Aucune commande sélectionnée."));
-        return false;
-    }
-
-    if (!demarrerTransaction(error)) {
-        return false;
-    }
-
-    if (!validerInterne(idCommande, error)) {
-        annulerTransaction();
-        return false;
-    }
-
-    return validerTransaction(error);
 }
 
 bool CommandeManager::annulerCommande(int idCommande, QString *error)
 {
-    if (!Database::instance()->isConnected()) {
-        setError(error, QStringLiteral("Aucune connexion active à la base de données."));
-        return false;
-    }
     if (idCommande <= 0) {
         setError(error, QStringLiteral("Aucune commande sélectionnée."));
         return false;
     }
-
-    if (!demarrerTransaction(error)) {
-        return false;
-    }
-
     QSqlQuery query(Database::instance()->getDatabase());
-    query.prepare(QStringLiteral(
-        "UPDATE commande SET statut = 'ANNULEE' "
-        "WHERE id_commande = ? AND statut IN ('EN_ATTENTE', 'VALIDEE')"));
+    query.prepare(QStringLiteral("UPDATE commande SET statut = 'ANNULEE' WHERE id_commande = ?"));
     query.addBindValue(idCommande);
-
     if (!query.exec()) {
-        annulerTransaction();
         setError(error, QStringLiteral("Impossible d'annuler la commande : %1")
                             .arg(query.lastError().text()));
         return false;
     }
     if (query.numRowsAffected() == 0) {
-        annulerTransaction();
-        setError(error, QStringLiteral(
-            "Cette commande ne peut pas être annulée (déjà annulée ou introuvable).\n"
-            "Une commande annulée ne réserve plus de quantité."));
+        setError(error, QStringLiteral("Commande introuvable."));
         return false;
     }
-
-    return validerTransaction(error);
+    return true;
 }
 
-QList<CommandeData> CommandeManager::getHistorique(const QString &recherche,
-                                                   const QString &statut,
-                                                   QString *error) const
+QList<CommandeData> CommandeManager::getHistorique(const QString &recherche, const QString &statut, QString *error) const
 {
     QList<CommandeData> result;
+    QSqlQuery query(Database::instance()->getDatabase());
 
     QString sql = QStringLiteral(
-        "SELECT c.id_commande, c.id_client, cl.nom, c.date_commande, c.statut, "
+        "SELECT c.id_commande, c.id_client, "
+        "       COALESCE(NULLIF(TRIM(c.nom_client_snapshot), ''), cl.nom, CONCAT('Client #', COALESCE(c.id_client,0))) AS nom_client_aff, "
+        "       c.date_commande, c.statut, "
         "       COALESCE(SUM(dc.quantite * dc.prix_unitaire), 0) AS montant, "
         "       COUNT(dc.id_detail) AS nb_lignes "
         "FROM commande c "
-        "INNER JOIN client cl ON cl.id_client = c.id_client "
+        "LEFT JOIN client cl ON cl.id_client = c.id_client "
         "LEFT JOIN detail_commande dc ON dc.id_commande = c.id_commande "
         "WHERE 1 = 1 ");
 
-    QStringList conditions;
-    QVariantList params;
+    QStringList champs;
+    QVariantList valeurs;
 
-    // Chaque mot saisi doit correspondre à au moins un champ : « Fenitra 23/10 »
-    // fonctionne donc comme un filtre combiné.
-    const QString term = recherche.trimmed();
-    if (!term.isEmpty()) {
-        const QStringList mots = term.split(QRegularExpression(QStringLiteral("\\s+")),
-                                            Qt::SkipEmptyParts);
-        for (QString mot : mots) {
-            // « #12 » ne recherche que par identifiant exact.
-            const bool idSeul = mot.startsWith(QLatin1Char('#'));
-            if (idSeul) {
-                mot.remove(0, 1);
-            }
-            mot = mot.trimmed();
-            if (mot.isEmpty()) {
-                continue;
-            }
-
-            QStringList champs;
-            QVariantList valeurs;
-
-            // id_commande est un INT : on le compare numériquement (et non avec
-            // un CAST ... LIKE, qui ferait aussi correspondre 15 pour « 5 »).
-            bool estEntier = false;
-            const int idMot = mot.toInt(&estEntier);
-            const bool numerique = estEntier && idMot > 0;
-            const bool commenceParChiffre = !mot.isEmpty() && mot.at(0).isDigit();
-            const bool formatDate = commenceParChiffre
-                                    && (mot.contains(QLatin1Char('/'))
-                                        || mot.contains(QLatin1Char('-'))
-                                        || mot.contains(QLatin1Char('.')));
-
-            const QString pattern = QStringLiteral("%") + echapperLike(mot)
-                                    + QStringLiteral("%");
-
-            if (idSeul) {
-                // « #5 » cible uniquement la commande n° 5.
-                if (!numerique) {
-                    continue;
-                }
+    const QString terme = recherche.trimmed();
+    if (!terme.isEmpty()) {
+        const QString pattern = QStringLiteral("%") + echapperLike(terme) + QStringLiteral("%");
+        bool rechercheParNumero = false;
+        if (terme.startsWith(QLatin1Char('#'))) {
+            const QString num = terme.mid(1).trimmed();
+            bool ok = false;
+            const int idCible = num.toInt(&ok);
+            if (ok && idCible > 0) {
                 champs << QStringLiteral("c.id_commande = ?");
-                valeurs << idMot;
-            } else if (numerique && mot.size() <= 3) {
-                // « 5 » cible la commande n° 5 (sans confondre avec un
-                // téléphone ou une date contenant 5).
+                valeurs << idCible;
+                rechercheParNumero = true;
+            }
+        } else {
+            bool ok = false;
+            const int idCible = terme.toInt(&ok);
+            if (ok && idCible > 0 && terme == QString::number(idCible)) {
                 champs << QStringLiteral("c.id_commande = ?");
-                valeurs << idMot;
-            } else if (formatDate) {
-                // date_commande est un DATETIME : on compare les formats usuels.
-                champs << QStringLiteral(
-                    "DATE_FORMAT(c.date_commande, '%d/%m/%Y') LIKE ? ESCAPE '!'");
-                valeurs << pattern;
-                champs << QStringLiteral(
-                    "DATE_FORMAT(c.date_commande, '%Y-%m-%d') LIKE ? ESCAPE '!'");
-                valeurs << pattern;
-                champs << QStringLiteral(
-                    "DATE_FORMAT(c.date_commande, '%d-%m-%Y') LIKE ? ESCAPE '!'");
-                valeurs << pattern;
-                champs << QStringLiteral(
-                    "DATE_FORMAT(c.date_commande, '%d.%m.%Y') LIKE ? ESCAPE '!'");
-                valeurs << pattern;
-            } else if (numerique) {
-                // 4 chiffres et plus : téléphone ou année (« 2026 »).
-                champs << QStringLiteral("COALESCE(cl.telephone, '') LIKE ? ESCAPE '!'");
-                valeurs << pattern;
-                champs << QStringLiteral(
-                    "DATE_FORMAT(c.date_commande, '%d/%m/%Y') LIKE ? ESCAPE '!'");
-                valeurs << pattern;
-                champs << QStringLiteral(
-                    "DATE_FORMAT(c.date_commande, '%Y-%m-%d') LIKE ? ESCAPE '!'");
-                valeurs << pattern;
-                champs << QStringLiteral(
-                    "DATE_FORMAT(c.date_commande, '%d-%m-%Y') LIKE ? ESCAPE '!'");
-                valeurs << pattern;
-                champs << QStringLiteral(
-                    "DATE_FORMAT(c.date_commande, '%d.%m.%Y') LIKE ? ESCAPE '!'");
-                valeurs << pattern;
-            } else {
-                // Nom : collation utf8mb4_unicode_ci de la colonne,
-                // donc insensible à la casse et aux accents.
-                champs << QStringLiteral("cl.nom LIKE ? ESCAPE '!'");
-                valeurs << pattern;
+                valeurs << idCible;
+                rechercheParNumero = true;
             }
-
-            if (champs.isEmpty()) {
-                continue;
-            }
-
-            conditions << QStringLiteral("(") + champs.join(QStringLiteral(" OR "))
-                              + QStringLiteral(")");
-            params += valeurs;
+        }
+        if (!rechercheParNumero) {
+            champs << QStringLiteral("(COALESCE(NULLIF(TRIM(c.nom_client_snapshot), ''), cl.nom) LIKE ? ESCAPE '!' OR COALESCE(c.telephone_client_snapshot, cl.telephone, '') LIKE ? ESCAPE '!')");
+            valeurs << pattern << pattern;
         }
     }
 
-    const QString statutFiltre = statut.trimmed();
-    if (!statutFiltre.isEmpty() && statutFiltre != QStringLiteral("TOUS")) {
-        conditions << QStringLiteral("c.statut = ?");
-        params << statutFiltre;
+    if (!statut.isEmpty()) {
+        champs << QStringLiteral("c.statut = ?");
+        valeurs << statut;
     }
 
-    if (!conditions.isEmpty()) {
-        sql += QStringLiteral("AND ") + conditions.join(QStringLiteral(" AND "))
-               + QStringLiteral(" ");
+    for (const QString &champ : champs) {
+        sql += QStringLiteral(" AND ") + champ;
     }
 
     sql += QStringLiteral(
-        "GROUP BY c.id_commande, c.id_client, cl.nom, c.date_commande, c.statut "
-        "ORDER BY c.date_commande DESC, c.id_commande DESC");
+        " GROUP BY c.id_commande, c.id_client, c.nom_client_snapshot, c.telephone_client_snapshot, cl.nom, c.date_commande, c.statut "
+        " ORDER BY c.date_commande DESC, c.id_commande DESC");
 
-    QSqlQuery query(Database::instance()->getDatabase());
     query.prepare(sql);
-    for (const QVariant &value : params) {
-        query.addBindValue(value);
+    for (const QVariant &v : valeurs) {
+        query.addBindValue(v);
     }
 
     if (!query.exec()) {
-        setError(error, QStringLiteral("Impossible de charger les commandes : %1")
+        setError(error, QStringLiteral("Impossible de charger l'historique : %1")
                             .arg(query.lastError().text()));
         return result;
     }
@@ -554,6 +513,7 @@ QList<CommandeData> CommandeManager::getHistorique(const QString &recherche,
         CommandeData commande;
         commande.id = query.value(0).toInt();
         commande.idClient = query.value(1).toInt();
+        commande.clientExistant = !query.isNull(1);
         commande.nomClient = query.value(2).toString();
         commande.dateCommande = query.value(3).toDateTime();
         commande.statut = query.value(4).toString();
@@ -567,23 +527,24 @@ QList<CommandeData> CommandeManager::getHistorique(const QString &recherche,
 QList<LigneCommande> CommandeManager::getDetails(int idCommande, QString *error) const
 {
     QList<LigneCommande> result;
-
+    if (idCommande <= 0) {
+        setError(error, QStringLiteral("Commande invalide."));
+        return result;
+    }
     QSqlQuery query(Database::instance()->getDatabase());
     query.prepare(QStringLiteral(
-        "SELECT dc.id_menu, m.id_plat, p.nom_plat, dc.quantite, dc.prix_unitaire "
+        "SELECT dc.id_menu, m.id_plat, COALESCE(NULLIF(TRIM(dc.nom_plat_snapshot), ''), p.nom_plat, '') AS nom_plat_aff, dc.quantite, dc.prix_unitaire "
         "FROM detail_commande dc "
-        "INNER JOIN menu_jour m ON m.id_menu = dc.id_menu "
-        "INNER JOIN plat p ON p.id_plat = m.id_plat "
+        "LEFT JOIN menu_jour m ON m.id_menu = dc.id_menu "
+        "LEFT JOIN plat p ON p.id_plat = m.id_plat "
         "WHERE dc.id_commande = ? "
-        "ORDER BY p.nom_plat ASC"));
+        "ORDER BY nom_plat_aff ASC"));
     query.addBindValue(idCommande);
-
     if (!query.exec()) {
-        setError(error, QStringLiteral("Impossible de charger les détails : %1")
+        setError(error, QStringLiteral("Impossible de charger le détail de la commande : %1")
                             .arg(query.lastError().text()));
         return result;
     }
-
     while (query.next()) {
         LigneCommande ligne;
         ligne.idMenu = query.value(0).toInt();
@@ -591,7 +552,6 @@ QList<LigneCommande> CommandeManager::getDetails(int idCommande, QString *error)
         ligne.nomPlat = query.value(2).toString();
         ligne.quantite = query.value(3).toInt();
         ligne.prixUnitaire = query.value(4).toDouble();
-        ligne.sousTotal = ligne.quantite * ligne.prixUnitaire;
         result.append(ligne);
     }
     return result;
@@ -600,101 +560,103 @@ QList<LigneCommande> CommandeManager::getDetails(int idCommande, QString *error)
 int CommandeManager::compterValidees(const QDate &jour, QString *error) const
 {
     QSqlQuery query(Database::instance()->getDatabase());
+    QString sql = QStringLiteral("SELECT COUNT(*) FROM commande WHERE statut = 'VALIDEE'");
     if (jour.isValid()) {
-        query.prepare(QStringLiteral(
-            "SELECT COUNT(*) FROM commande "
-            "WHERE statut = 'VALIDEE' AND DATE(date_commande) = ?"));
+        sql += QStringLiteral(" AND DATE(date_commande) = ?");
+        query.prepare(sql);
         query.addBindValue(jour.toString(QStringLiteral("yyyy-MM-dd")));
-        if (!query.exec() || !query.next()) {
-            setError(error, QStringLiteral("Impossible de compter les commandes validées : %1")
-                                .arg(query.lastError().text()));
-            return 0;
-        }
-        return query.value(0).toInt();
+    } else {
+        query.prepare(sql);
     }
-
-    if (!query.exec(QStringLiteral("SELECT COUNT(*) FROM commande WHERE statut = 'VALIDEE'"))
-        || !query.next()) {
+    if (!query.exec()) {
         setError(error, QStringLiteral("Impossible de compter les commandes validées : %1")
                             .arg(query.lastError().text()));
         return 0;
     }
-    return query.value(0).toInt();
+    if (query.next()) {
+        return query.value(0).toInt();
+    }
+    return 0;
 }
 
 double CommandeManager::chiffreAffaires(const QDate &jour, QString *error) const
 {
     QSqlQuery query(Database::instance()->getDatabase());
+    QString sql = QStringLiteral(
+        "SELECT COALESCE(SUM(dc.quantite * dc.prix_unitaire), 0) "
+        "FROM detail_commande dc "
+        "INNER JOIN commande c ON c.id_commande = dc.id_commande "
+        "WHERE c.statut = 'VALIDEE'");
     if (jour.isValid()) {
-        query.prepare(QStringLiteral(
-            "SELECT COALESCE(SUM(dc.quantite * dc.prix_unitaire), 0) "
-            "FROM detail_commande dc "
-            "INNER JOIN commande c ON c.id_commande = dc.id_commande "
-            "WHERE c.statut = 'VALIDEE' AND DATE(c.date_commande) = ?"));
+        sql += QStringLiteral(" AND DATE(c.date_commande) = ?");
+        query.prepare(sql);
         query.addBindValue(jour.toString(QStringLiteral("yyyy-MM-dd")));
-        if (!query.exec() || !query.next()) {
-            setError(error, QStringLiteral("Impossible de calculer le chiffre d'affaires : %1")
-                                .arg(query.lastError().text()));
-            return 0.0;
-        }
-        return query.value(0).toDouble();
+    } else {
+        query.prepare(sql);
     }
-
-    if (!query.exec(QStringLiteral(
-            "SELECT COALESCE(SUM(dc.quantite * dc.prix_unitaire), 0) "
-            "FROM detail_commande dc "
-            "INNER JOIN commande c ON c.id_commande = dc.id_commande "
-            "WHERE c.statut = 'VALIDEE'"))
-        || !query.next()) {
+    if (!query.exec()) {
         setError(error, QStringLiteral("Impossible de calculer le chiffre d'affaires : %1")
                             .arg(query.lastError().text()));
         return 0.0;
     }
-    return query.value(0).toDouble();
+    if (query.next()) {
+        return query.value(0).toDouble();
+    }
+    return 0.0;
 }
 
 double CommandeManager::montantCommande(int idCommande, QString *error) const
 {
+    if (idCommande <= 0) {
+        setError(error, QStringLiteral("Commande invalide."));
+        return 0.0;
+    }
     QSqlQuery query(Database::instance()->getDatabase());
     query.prepare(QStringLiteral(
         "SELECT COALESCE(SUM(quantite * prix_unitaire), 0) "
         "FROM detail_commande WHERE id_commande = ?"));
     query.addBindValue(idCommande);
-    if (!query.exec() || !query.next()) {
-        setError(error, QStringLiteral("Impossible de calculer le montant de la commande : %1")
+    if (!query.exec()) {
+        setError(error, QStringLiteral("Impossible de calculer le montant : %1")
                             .arg(query.lastError().text()));
-        return -1.0;
+        return 0.0;
     }
-    return query.value(0).toDouble();
+    if (query.next()) {
+        return query.value(0).toDouble();
+    }
+    return 0.0;
 }
 
 QList<CommandeData> CommandeManager::getRecentes(int limite, QString *error) const
 {
     QList<CommandeData> result;
-
+    if (limite <= 0) {
+        limite = 5;
+    }
     QSqlQuery query(Database::instance()->getDatabase());
     query.prepare(QStringLiteral(
-        "SELECT c.id_commande, c.id_client, cl.nom, c.date_commande, c.statut, "
+        "SELECT c.id_commande, c.id_client, "
+        "       COALESCE(NULLIF(TRIM(c.nom_client_snapshot), ''), cl.nom, CONCAT('Client #', COALESCE(c.id_client,0))) AS nom_client_aff, "
+        "       c.date_commande, c.statut, "
         "       COALESCE(SUM(dc.quantite * dc.prix_unitaire), 0) AS montant, "
         "       COUNT(dc.id_detail) AS nb_lignes "
         "FROM commande c "
-        "INNER JOIN client cl ON cl.id_client = c.id_client "
+        "LEFT JOIN client cl ON cl.id_client = c.id_client "
         "LEFT JOIN detail_commande dc ON dc.id_commande = c.id_commande "
-        "GROUP BY c.id_commande, c.id_client, cl.nom, c.date_commande, c.statut "
+        "GROUP BY c.id_commande, c.id_client, c.nom_client_snapshot, cl.nom, c.date_commande, c.statut "
         "ORDER BY c.date_commande DESC, c.id_commande DESC "
         "LIMIT ?"));
-    query.addBindValue(qMax(1, limite));
-
+    query.addBindValue(limite);
     if (!query.exec()) {
         setError(error, QStringLiteral("Impossible de charger les commandes récentes : %1")
                             .arg(query.lastError().text()));
         return result;
     }
-
     while (query.next()) {
         CommandeData commande;
         commande.id = query.value(0).toInt();
         commande.idClient = query.value(1).toInt();
+        commande.clientExistant = !query.isNull(1);
         commande.nomClient = query.value(2).toString();
         commande.dateCommande = query.value(3).toDateTime();
         commande.statut = query.value(4).toString();
@@ -703,4 +665,60 @@ QList<CommandeData> CommandeManager::getRecentes(int limite, QString *error) con
         result.append(commande);
     }
     return result;
+}
+
+bool CommandeManager::supprimerCommande(int idCommande, QString *error)
+{
+    if (idCommande <= 0) {
+        setError(error, QStringLiteral("Aucune commande sélectionnée."));
+        return false;
+    }
+
+    QSqlDatabase db = Database::instance()->getDatabase();
+    if (!db.isOpen()) {
+        setError(error, QStringLiteral("Aucune connexion active à la base de données."));
+        return false;
+    }
+
+    if (!demarrerTransaction(error)) {
+        return false;
+    }
+
+    QSqlQuery verif(db);
+    verif.prepare(QStringLiteral("SELECT id_commande FROM commande WHERE id_commande = ? FOR UPDATE"));
+    verif.addBindValue(idCommande);
+    if (!verif.exec() || !verif.next()) {
+        annulerTransaction();
+        setError(error, QStringLiteral("Commande introuvable."));
+        return false;
+    }
+
+    // Supprimer les détails d'abord si nécessaire (même si ON DELETE CASCADE est présent)
+    {
+        QSqlQuery delDetail(db);
+        delDetail.prepare(QStringLiteral("DELETE FROM detail_commande WHERE id_commande = ?"));
+        delDetail.addBindValue(idCommande);
+        if (!delDetail.exec()) {
+            annulerTransaction();
+            setError(error, QStringLiteral("Impossible de supprimer les détails de la commande : %1")
+                                .arg(delDetail.lastError().text()));
+            return false;
+        }
+    }
+
+    QSqlQuery delCmd(db);
+    delCmd.prepare(QStringLiteral("DELETE FROM commande WHERE id_commande = ?"));
+    delCmd.addBindValue(idCommande);
+    if (!delCmd.exec()) {
+        annulerTransaction();
+        setError(error, QStringLiteral("Impossible de supprimer la commande : %1")
+                            .arg(delCmd.lastError().text()));
+        return false;
+    }
+
+    if (!validerTransaction(error)) {
+        annulerTransaction();
+        return false;
+    }
+    return true;
 }

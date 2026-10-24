@@ -149,7 +149,39 @@ bool PlatManager::supprimer(int idPlat, QString *error)
         return false;
     }
 
-    QSqlQuery query(Database::instance()->getDatabase());
+    QSqlDatabase db = Database::instance()->getDatabase();
+    if (!db.isOpen()) {
+        setError(error, QStringLiteral("Aucune connexion active à la base de données."));
+        return false;
+    }
+
+    // Sauvegarder le nom du plat pour les snapshots des détails de commandes existants
+    QString nomPlat;
+    {
+        QSqlQuery info(db);
+        info.prepare(QStringLiteral("SELECT nom_plat FROM plat WHERE id_plat = ?"));
+        info.addBindValue(idPlat);
+        if (info.exec() && info.next()) {
+            nomPlat = info.value(0).toString();
+        }
+    }
+
+    // Mettre à jour les snapshots dans detail_commande via menu_jour lié
+    if (!nomPlat.isEmpty()) {
+        QSqlQuery snap(db);
+        snap.prepare(QStringLiteral(
+            "UPDATE detail_commande dc "
+            "JOIN menu_jour m ON m.id_menu = dc.id_menu "
+            "SET dc.nom_plat_snapshot = COALESCE(NULLIF(TRIM(dc.nom_plat_snapshot), ''), ?), "
+            "    dc.nom_menu_snapshot = COALESCE(NULLIF(TRIM(dc.nom_menu_snapshot), ''), ?) "
+            "WHERE m.id_plat = ?"));
+        snap.addBindValue(nomPlat);
+        snap.addBindValue(nomPlat);
+        snap.addBindValue(idPlat);
+        snap.exec();
+    }
+
+    QSqlQuery query(db);
     query.prepare(QStringLiteral("DELETE FROM plat WHERE id_plat = ?"));
     query.addBindValue(idPlat);
 
@@ -157,8 +189,8 @@ bool PlatManager::supprimer(int idPlat, QString *error)
         const QSqlError err = query.lastError();
         if (err.nativeErrorCode() == QStringLiteral("1451")) {
             setError(error, QStringLiteral(
-                "Suppression impossible : ce plat est utilisé dans un menu ou une commande.\n"
-                "Les données historiques doivent être préservées."));
+                "Suppression impossible : ce plat est toujours référencé.\n"
+                "Les données historiques ont été conservées via les informations enregistrées."));
         } else {
             setError(error, QStringLiteral("Impossible de supprimer le plat : %1").arg(err.text()));
         }

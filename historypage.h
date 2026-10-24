@@ -25,6 +25,7 @@ private slots:
     void onSelectionChanged();
     void onValider();
     void onAnnuler();
+    void onSupprimer();
 
 private:
     int idSelectionne() const;
@@ -41,6 +42,7 @@ private:
     QLabel *m_lblAucunResultat;
     QPushButton *m_btnValider;
     QPushButton *m_btnAnnuler;
+    QPushButton *m_btnSupprimer;
     QTimer *m_timerRecherche;
 };
 

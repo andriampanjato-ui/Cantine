@@ -241,7 +241,37 @@ bool MenuManager::supprimer(int idMenu, QString *error)
         return false;
     }
 
-    QSqlQuery query(Database::instance()->getDatabase());
+    QSqlDatabase db = Database::instance()->getDatabase();
+    if (!db.isOpen()) {
+        setError(error, QStringLiteral("Aucune connexion active à la base de données."));
+        return false;
+    }
+
+    QString nomPlat;
+    {
+        QSqlQuery info(db);
+        info.prepare(QStringLiteral(
+            "SELECT p.nom_plat FROM menu_jour m LEFT JOIN plat p ON p.id_plat = m.id_plat WHERE m.id_menu = ?"));
+        info.addBindValue(idMenu);
+        if (info.exec() && info.next()) {
+            nomPlat = info.value(0).toString();
+        }
+    }
+
+    if (!nomPlat.isEmpty()) {
+        QSqlQuery snap(db);
+        snap.prepare(QStringLiteral(
+            "UPDATE detail_commande SET "
+            "nom_plat_snapshot = COALESCE(NULLIF(TRIM(nom_plat_snapshot), ''), ?), "
+            "nom_menu_snapshot = COALESCE(NULLIF(TRIM(nom_menu_snapshot), ''), ?) "
+            "WHERE id_menu = ?"));
+        snap.addBindValue(nomPlat);
+        snap.addBindValue(nomPlat);
+        snap.addBindValue(idMenu);
+        snap.exec();
+    }
+
+    QSqlQuery query(db);
     query.prepare(QStringLiteral("DELETE FROM menu_jour WHERE id_menu = ?"));
     query.addBindValue(idMenu);
 
@@ -249,10 +279,10 @@ bool MenuManager::supprimer(int idMenu, QString *error)
         const QSqlError err = query.lastError();
         if (err.nativeErrorCode() == QStringLiteral("1451")) {
             setError(error, QStringLiteral(
-                "Suppression impossible : ce menu est référencé par des commandes.\n"
-                "Les données historiques doivent être préservées."));
+                "Suppression impossible : ce menu est toujours référencé par des commandes.\n"
+                "Les données historiques sont conservées grâce aux informations enregistrées."));
         } else {
-            setError(error, QStringLiteral("Impossible de supprimer le menu : %1").arg(err.text()));
+            setError(error, QStringLiteral("Impossible de retirer le menu : %1").arg(err.text()));
         }
         return false;
     }

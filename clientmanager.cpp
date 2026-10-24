@@ -131,7 +131,44 @@ bool ClientManager::supprimer(int idClient, QString *error)
         return false;
     }
 
-    QSqlQuery query(Database::instance()->getDatabase());
+    QSqlDatabase db = Database::instance()->getDatabase();
+    if (!db.isOpen()) {
+        setError(error, QStringLiteral("Aucune connexion active à la base de données."));
+        return false;
+    }
+
+    // Sauvegarder les informations du client avant suppression pour les snapshots.
+    QString nomClient;
+    QString telephoneClient;
+    {
+        QSqlQuery info(db);
+        info.prepare(QStringLiteral("SELECT nom, telephone FROM client WHERE id_client = ?"));
+        info.addBindValue(idClient);
+        if (info.exec() && info.next()) {
+            nomClient = info.value(0).toString();
+            telephoneClient = info.value(1).toString();
+        }
+    }
+
+    // Mettre à jour les snapshots des commandes existantes avec les données du client.
+    {
+        QSqlQuery snap(db);
+        snap.prepare(QStringLiteral(
+            "UPDATE commande SET "
+            "nom_client_snapshot = COALESCE(NULLIF(TRIM(nom_client_snapshot), ''), ?), "
+            "telephone_client_snapshot = COALESCE(NULLIF(TRIM(telephone_client_snapshot), ''), ?) "
+            "WHERE id_client = ?"));
+        snap.addBindValue(nomClient);
+        snap.addBindValue(telephoneClient);
+        snap.addBindValue(idClient);
+        if (!snap.exec()) {
+            setError(error, QStringLiteral("Impossible de sauvegarder l'historique du client : %1")
+                                .arg(snap.lastError().text()));
+            return false;
+        }
+    }
+
+    QSqlQuery query(db);
     query.prepare(QStringLiteral("DELETE FROM client WHERE id_client = ?"));
     query.addBindValue(idClient);
 
@@ -139,7 +176,7 @@ bool ClientManager::supprimer(int idClient, QString *error)
         const QSqlError err = query.lastError();
         if (err.nativeErrorCode() == QStringLiteral("1451")) {
             setError(error, QStringLiteral(
-                "Suppression impossible : ce client possède des commandes enregistrées.\n"
+                "Suppression impossible : ce client est toujours référencé.\n"
                 "Les données historiques doivent être préservées."));
         } else {
             setError(error, QStringLiteral("Impossible de supprimer le client : %1").arg(err.text()));

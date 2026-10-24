@@ -20,6 +20,7 @@ struct CommandeData
 {
     int id = 0;
     int idClient = 0;
+    bool clientExistant = true;
     QString nomClient;
     QDateTime dateCommande;
     QString statut;
@@ -51,6 +52,9 @@ public:
     double chiffreAffaires(const QDate &jour = QDate(), QString *error = nullptr) const;
     double montantCommande(int idCommande, QString *error = nullptr) const;
     QList<CommandeData> getRecentes(int limite = 5, QString *error = nullptr) const;
+
+    // Supprime une commande et ses détails (administrateur). Retourne true si supprimée.
+    bool supprimerCommande(int idCommande, QString *error = nullptr);
 
 private:
     bool validerInterne(int idCommande, QString *error);

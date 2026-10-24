@@ -48,7 +48,7 @@ PlatsPage::PlatsPage(QWidget *parent)
     m_table = new QTableWidget(this);
     m_table->setColumnCount(3);
     m_table->setHorizontalHeaderLabels(
-        {QStringLiteral("ID"), QStringLiteral("Nom du plat"), QStringLiteral("Prix")});
+        {QStringLiteral("N°"), QStringLiteral("Nom du plat"), QStringLiteral("Prix")});
     m_table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
     m_table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
     m_table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
@@ -118,10 +118,10 @@ void PlatsPage::refresh()
     for (int row = 0; row < plats.size(); ++row) {
         const PlatData &plat = plats.at(row);
 
-        auto *itemId = new QTableWidgetItem(QString::number(plat.id));
-        itemId->setData(Qt::UserRole, plat.id);
-        itemId->setTextAlignment(Qt::AlignCenter);
-        m_table->setItem(row, 0, itemId);
+        auto *itemNumero = new QTableWidgetItem(QString::number(row + 1));
+        itemNumero->setData(Qt::UserRole, plat.id);
+        itemNumero->setTextAlignment(Qt::AlignCenter);
+        m_table->setItem(row, 0, itemNumero);
         m_table->setItem(row, 1, new QTableWidgetItem(plat.nom));
 
         auto *itemPrix = new QTableWidgetItem(formatAr(plat.prix));

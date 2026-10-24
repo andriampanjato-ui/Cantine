@@ -22,4 +22,20 @@ inline QString formatDateTime(const QDateTime &dateTime)
     return dateTime.toString(QStringLiteral("dd/MM/yyyy HH:mm"));
 }
 
+inline QString formaterMontant(double montant)
+{
+    return QString::number(montant, 'f', 2) + QStringLiteral(" Ar");
+}
+
+inline QString statutVersLibelle(const QString &statut)
+{
+    if (statut == QStringLiteral("VALIDEE")) {
+        return QStringLiteral("Validée");
+    }
+    if (statut == QStringLiteral("ANNULEE")) {
+        return QStringLiteral("Annulée");
+    }
+    return QStringLiteral("En attente");
+}
+
 #endif // UTILS_H

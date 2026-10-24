@@ -54,7 +54,7 @@ MenuPage::MenuPage(QWidget *parent)
     m_table = new QTableWidget(this);
     m_table->setColumnCount(6);
     m_table->setHorizontalHeaderLabels(
-        {QStringLiteral("ID"), QStringLiteral("Plat"), QStringLiteral("Prix"),
+        {QStringLiteral("N°"), QStringLiteral("Plat"), QStringLiteral("Prix"),
          QStringLiteral("Qté initiale"), QStringLiteral("Qté commandée"),
          QStringLiteral("Qté restante")});
     m_table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
@@ -158,11 +158,11 @@ void MenuPage::refresh()
     for (int row = 0; row < menus.size(); ++row) {
         const MenuData &menu = menus.at(row);
 
-        auto *itemId = new QTableWidgetItem(QString::number(menu.idMenu));
-        itemId->setData(Qt::UserRole, menu.idMenu);
-        itemId->setData(Qt::UserRole + 1, menu.idPlat);
-        itemId->setTextAlignment(Qt::AlignCenter);
-        m_table->setItem(row, 0, itemId);
+        auto *itemNumero = new QTableWidgetItem(QString::number(row + 1));
+        itemNumero->setData(Qt::UserRole, menu.idMenu);
+        itemNumero->setData(Qt::UserRole + 1, menu.idPlat);
+        itemNumero->setTextAlignment(Qt::AlignCenter);
+        m_table->setItem(row, 0, itemNumero);
         m_table->setItem(row, 1, new QTableWidgetItem(menu.nomPlat));
 
         auto *itemPrix = new QTableWidgetItem(formatAr(menu.prix));
